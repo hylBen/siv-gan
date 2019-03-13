@@ -1,3 +1,4 @@
+## Pytorch implementation of DCGAN by Hao Zhang
 ### main-MNIST.py
 
 ```python
@@ -111,3 +112,271 @@ while True:
     print('[epoch %0d, time %4f]' % (epoch_idx, tend-tstart))
 
 ```
+
+### train.py
+
+```python
+# coding: utf-8
+
+from torch.nn import functional as F
+#import torch.nn as nn
+
+
+class Trainer(object):
+    def __init__(self, generator, discriminator, g_optimizer, d_optimizer):
+        self.generator = generator
+        self.discriminator = discriminator
+        self.g_optimizer = g_optimizer
+        self.d_optimizer = d_optimizer
+
+
+    def generator_trainstep(self, z):
+        toogle_grad(self.generator, True)
+        toogle_grad(self.discriminator, False)
+        self.generator.train()
+        self.discriminator.train()
+        self.g_optimizer.zero_grad()
+
+        x_fake = self.generator(z)
+        d_fake = self.discriminator(x_fake)
+        gloss = self.compute_loss(d_fake, 1)
+        gloss.backward()
+
+        self.g_optimizer.step()
+
+        return gloss.item()
+
+    def discriminator_trainstep(self, x_real, z):
+        toogle_grad(self.generator, False)
+        toogle_grad(self.discriminator, True)
+        self.generator.train()
+        self.discriminator.train()
+        self.d_optimizer.zero_grad()
+
+        # On real data
+        d_real = self.discriminator(x_real)
+        dloss_real = self.compute_loss(d_real, 1)
+
+        # On fake data
+        x_fake = self.generator(z)
+        d_fake = self.discriminator(x_fake)
+        dloss_fake = self.compute_loss(d_fake, 0)
+
+        dloss = dloss_real + dloss_fake
+        dloss.backward()
+        self.d_optimizer.step()
+
+        return dloss.item()
+
+    def compute_loss(self, d_out, target):
+        targets = d_out.new_full(size=d_out.size(), fill_value=target)
+        loss = F.binary_cross_entropy_with_logits(d_out, targets)
+
+        return loss
+
+
+# Utility functions
+def toogle_grad(model, requires_grad):
+    for p in model.parameters():
+        p.requires_grad_(requires_grad)
+
+```python
+
+### Model.py
+
+```python
+import torch.nn as nn
+
+
+class Generator(nn.Module):
+
+    def __init__(self, nz, ngf):
+        super(Generator, self).__init__()
+        self.fc = nn.Sequential(nn.Linear(nz, 2 * 2 * ngf * 8), nn.ReLU(True))
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 2, 1),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf * 2,     ngf, 4, 2, 1),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            #
+            nn.ConvTranspose2d(    ngf,      1, 4, 2, 1),
+            nn.Tanh()
+        )
+
+
+    def forward(self, input):
+        output = self.fc(input)
+        output = output.view(output.size(0), -1, 2, 2)
+        output = self.main(output)
+        return output
+
+class Discriminator(nn.Module):
+
+    def __init__(self, ndf):
+        super(Discriminator, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(1, ndf, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 2),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.fc = nn.Linear(2 * 2 * ndf * 8, 1)
+
+    def forward(self, input):
+        output = self.main(input)
+        output = output.view(output.size(0), -1)
+        output = self.fc(output)
+        return output
+
+def build_models(config):
+
+    generator = Generator(
+        nz=config['z_dist']['dim'],
+        ngf=64)
+    discriminator = Discriminator(ndf=64)
+
+    return generator, discriminator
+
+
+```
+
+### Optimzer.py
+
+```python
+from torch import optim
+
+
+def build_optimizers(generator, discriminator, config):
+    optimizer = config['training']['optimizer']
+    lr_g = config['training']['lr_g']
+    lr_d = config['training']['lr_d']
+
+    g_params = generator.parameters()
+    d_params = discriminator.parameters()
+
+    # Optimizers
+    if optimizer == 'rmsprop':
+        g_optimizer = optim.RMSprop(g_params, lr=lr_g, alpha=0.99, eps=1e-8)
+        d_optimizer = optim.RMSprop(d_params, lr=lr_d, alpha=0.99, eps=1e-8)
+    elif optimizer == 'adam':
+        g_optimizer = optim.Adam(g_params, lr=lr_g, betas=(0.5, 0.999))
+        d_optimizer = optim.Adam(d_params, lr=lr_d, betas=(0.5, 0.999))
+    elif optimizer == 'sgd':
+        g_optimizer = optim.SGD(g_params, lr=lr_g, momentum=0.)
+        d_optimizer = optim.SGD(d_params, lr=lr_d, momentum=0.)
+
+    return g_optimizer, d_optimizer
+    
+```
+
+### MNIST_data_loader.py
+
+```python
+import torch
+from torch.utils.data import DataLoader
+import numpy as np
+import scipy.io as sio
+import os
+
+class MNIST_Loader():
+    def __init__(self, datapath='./data/mnist_train.mat'):
+        data = sio.loadmat(datapath)
+        X_train = np.expand_dims(data['X_train_img'], axis=1) * 2. - 1
+        self.data = torch.from_numpy(X_train).float()
+
+        #data = np.load(datapath)
+        #X_train= data * 2. - 1
+        #self.data = torch.from_numpy(X_train).float()
+
+    def __len__(self):
+        return self.data.size(0)
+
+    def __getitem__(self, index):
+        sample = self.data[index]
+
+        return sample
+
+def get_mnist_loader(batch_size):
+    dataset = MNIST_Loader()
+
+
+    data_loader = DataLoader(dataset=dataset,
+                             batch_size=batch_size,
+                             shuffle=True,
+                             drop_last=True)
+    return data_loader
+    
+```
+
+### distributions.py
+
+```python
+import torch
+from torch import distributions
+
+
+def get_zdist(dist_name, dim, device=None):
+    # Get distribution
+    if dist_name == 'uniform':
+        low = -torch.ones(dim, device=device)
+        high = torch.ones(dim, device=device)
+        zdist = distributions.Uniform(low, high)
+    elif dist_name == 'gauss':
+        mu = torch.zeros(dim, device=device)
+        scale = torch.ones(dim, device=device)
+        zdist = distributions.Normal(mu, scale)
+    else:
+        raise NotImplementedError
+
+    # Add dim attribute
+    zdist.dim = dim
+
+    return zdist
+
+```
+
+### MNIST_dcgan.yaml
+
+```python
+
+
+gpu:
+  device: 0
+data:
+  type: mnist
+  train_dir: data/
+  test_dir: data/
+  img_size: 28
+z_dist:
+  type: gauss
+  dim: 256
+training:
+  out_dir: output/mnist_dcgan
+  batch_size: 64
+  nworkers: 0
+  optimizer: adam
+  lr_g: 0.0002
+  lr_d: 0.0002
+  sample_every: 1000
+
+
+```
+
+
